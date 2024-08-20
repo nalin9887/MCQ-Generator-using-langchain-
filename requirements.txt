@@ -1,0 +1,8 @@
+streamlit 
+langchain 
+openai 
+python-dotenv 
+pandas 
+requests 
+beautifulsoup4
+google-generativeai
