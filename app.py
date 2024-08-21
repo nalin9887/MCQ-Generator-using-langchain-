@@ -6,6 +6,11 @@ import google.generativeai as genai
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
+from docx import Document
+import time
 
 # Load environment variables
 load_dotenv()
@@ -17,66 +22,70 @@ genai.configure(api_key=GOOGLE_API_KEY)
 # Initialize Gemini model
 model = genai.GenerativeModel('gemini-pro')
 
-# Define the response JSON structure
-RESPONSE_JSON = {
-    "1": {
-        "mcq": "multiple choice question",
-        "options": {
-            "a": "choice here",
-            "b": "choice here",
-            "c": "choice here",
-            "d": "choice here",
-        },
-        "correct": "correct answer",
-    },
-}
-
 def generate_mcqs(text, number, tone):
     prompt = f"""
     Text: {text}
     
     You are an expert MCQ maker. Given the above text, create a quiz of {number} multiple choice questions in {tone} tone. 
     Make sure the questions are not repeated and check all the questions to conform to the text.
-    Format your response like the RESPONSE_JSON below and use it as a guide. 
-    Ensure to make {number} MCQs.
+    Format your response like the example below:
     
-    RESPONSE_JSON:
-    {json.dumps(RESPONSE_JSON)}
+    1: What is the name of the main character in the Naruto series?
+    a) Sasuke Uchiha
+    b) Naruto Uzumaki
+    c) Sakura Haruno
+    d) Kakashi Hatake
+    Correct answer: b
     """
     
-    response = model.generate_content(prompt)
-    return response.text
-
-def process_mcqs(quiz):
-    # Remove any markdown code block syntax if present
-    quiz = quiz.replace("```json", "").replace("```", "").strip()
-    quiz = json.loads(quiz)
-    quiz_table_data = []
-    for key, value in quiz.items():
-        mcq = value["mcq"]
-        options = " | ".join(
-            [f"{option}: {option_value}" for option, option_value in value["options"].items()]
-        )
-        correct = value["correct"]
-        quiz_table_data.append({"MCQ": mcq, "Choices": options, "Correct": correct})
+    for attempt in range(3):  # Retry up to 3 times
+        try:
+            response = model.generate_content(prompt)
+            quiz = response.text
+            
+            # Parse the generated quiz
+            mcqs = quiz.split('\n\n')
+            quiz_data = []
+            answer_key = {}
+            for mcq in mcqs:
+                lines = mcq.split('\n')
+                if len(lines) < 5:
+                    continue
+                question = lines[0].strip()  # Keep the question as is
+                options = {chr(ord('a') + i): line[3:].strip() for i, line in enumerate(lines[1:5])}  # Start from index 3
+                correct = lines[5][14:].strip()  # Remove "Correct answer: " and strip whitespace
+                quiz_data.append({"Question": question, "Options": options})
+                answer_key[question] = correct  # Store the correct answer
+                
+            return quiz_data, answer_key
+        
+        except Exception as e:
+            if "500" in str(e):
+                st.warning("Internal server error occurred. Retrying...")
+                time.sleep(2 ** attempt)  # Exponential backoff
+            else:
+                st.error(f"An error occurred: {str(e)}")
+                return None, None
     
-    return pd.DataFrame(quiz_table_data)
+    st.error("Failed to generate MCQs after multiple attempts.")
+    return None, None
 
 def get_webpage_content(url):
     response = requests.get(url)
     soup = BeautifulSoup(response.content, 'html.parser')
     return soup.get_text()
 
-# Streamlit UI
-st.set_page_config(layout="wide")
+# Streamlit UI setup
+st.set_page_config(page_title="MCQ Generator (Powered by Gemini)", layout="wide")
+
 st.title("MCQ Generator (Powered by Gemini)")
 
-# Sidebar
+# Sidebar controls
 st.sidebar.header("Controls")
-number_of_questions = st.sidebar.number_input("Number of questions", min_value=1, max_value=20, value=5)
+number_of_questions = st.sidebar.number_input("Number of questions", min_value=1, value=5)
 tone = st.sidebar.selectbox("Tone", options=["simple", "neutral", "professional"])
 
-# Main area
+# Main area with tabs
 tab1, tab2 = st.tabs(["Upload File", "Enter URL"])
 
 with tab1:
@@ -95,18 +104,76 @@ if st.sidebar.button("Generate MCQs"):
         st.stop()
     
     with st.spinner("Generating MCQs..."):
-        quiz = generate_mcqs(text, number_of_questions, tone)
-        quiz_df = process_mcqs(quiz)
+        quiz_data, answer_key = generate_mcqs(text, number_of_questions, tone)
         
-        st.subheader("Generated MCQs")
-        st.dataframe(quiz_df, use_container_width=True)
+        if quiz_data:
+            st.session_state.quiz_data = quiz_data  # Store generated MCQs in session state
+            st.session_state.answer_key = answer_key  # Store answer key in session state
+            
+            st.subheader("Generated MCQs")
+            
+            # Display the generated MCQs
+            for mcq in quiz_data:
+                st.write(f"**{mcq['Question']}**")
+                for option, text in mcq['Options'].items():
+                    st.write(f"{option}) {text}")
+                st.write("---")
+        else:
+            st.error("No MCQs generated.")
+    
+# Download options
+if 'quiz_data' in st.session_state:
+    download_format = st.selectbox("Download as", options=["PDF", "Word", "Answer Key"])
+    
+    if download_format == "PDF":
+        pdf_file = SimpleDocTemplate('mcqs.pdf', pagesize=letter)
+        elements = []
+        styles = getSampleStyleSheet()  # Get default styles
         
-        csv = quiz_df.to_csv(index=False)
+        for mcq in st.session_state.quiz_data:
+            elements.append(Paragraph(mcq['Question'], styles['Heading1']))
+            for option, text in mcq['Options'].items():
+                elements.append(Paragraph(f"{option}) {text}", styles['Normal']))
+            elements.append(Paragraph("", styles['Normal']))  # Add space between questions
+        
+        pdf_file.build(elements)
         st.download_button(
-            label="Download MCQs as CSV",
-            data=csv,
-            file_name="mcqs.csv",
-            mime="text/csv",
+            label="Download MCQs as PDF",
+            data=open('mcqs.pdf', 'rb').read(),
+            file_name="mcqs.pdf",
+            mime="application/pdf",
+        )
+    
+    elif download_format == "Word":
+        document = Document()
+        
+        for mcq in st.session_state.quiz_data:
+            document.add_heading(mcq['Question'], level=1)
+            for option, text in mcq['Options'].items():
+                document.add_paragraph(f"{option}) {text}")
+            document.add_paragraph()
+        
+        document.save('mcqs.docx')
+        st.download_button(
+            label="Download MCQs as Word",
+            data=open('mcqs.docx', 'rb').read(),
+            file_name="mcqs.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    
+    elif download_format == "Answer Key":
+        answer_key_doc = Document()
+        answer_key_doc.add_heading("Answer Key", level=1)
+        
+        for question, answer in st.session_state.answer_key.items():
+            answer_key_doc.add_paragraph(f"{question} - Correct answer: {answer}")
+        
+        answer_key_doc.save('answer_key.docx')
+        st.download_button(
+            label="Download Answer Key",
+            data=open('answer_key.docx', 'rb').read(),
+            file_name="answer_key.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
 
 st.sidebar.markdown("---")
