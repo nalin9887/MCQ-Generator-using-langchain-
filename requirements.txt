@@ -6,3 +6,5 @@ pandas
 requests 
 beautifulsoup4
 google-generativeai
+reportlab
+python-docx
